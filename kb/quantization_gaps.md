@@ -41,6 +41,71 @@ transposed convolution works end to end. Do not route around these.
 
 **Never read table 1 without filtering by the installed PyTorch version.**
 
+### 1.1 When the PyTorch version is fixed
+
+Upgrading is often not an option — a pinned toolchain, a validated build, a vendor SDK that
+targets one torch release. The good news is that a version gate is **not** a hard failure.
+
+Look at what the gate actually does (`quantizer.py`, `_rewrite_quantize_graph`):
+
+```python
+disable_quantize_op_list = UNSUPPORTED_PYTORCH_QUANTIZATION_OP_LIST.copy()
+...
+supported_version = disable_quantize_op_list.get(cur_module.kind, torch.__version__)
+return supported_version is None or LooseVersion(torch.__version__) < supported_version
+```
+
+A gated op lands in `disable_quantize_op_list`, which means *"do not quantize this, put
+Quant/DeQuant around it"*. The outcome is a **float island** — identical to §2. The model still
+converts, still runs, and the only cost is placement. So the question is never "does it work" but
+"how much of the graph did I lose, and can I get it back".
+
+**The generic recovery, in order of effort:**
+
+1. **`quantize_op_action={M: 'rewrite'}` + `rewrite_quantizable=True`.** `'rewrite'` adds the module
+   to `skip_types`, which keeps the fake-quant nodes on both sides of the op instead of collapsing
+   them — so the op stays float in PyTorch but its input and output qparams survive into the
+   converter, which can then fold it back into a quantized TFLite kernel. This is the intended
+   escape hatch for exactly this situation, and it is independent of why the op was disabled.
+   Whether it lands a quantized kernel depends on the TFLite op having an int8 implementation, so
+   verify the result rather than assuming it.
+
+2. **Rewrite the op in the model into primitives that quantize on your version.** Everything in
+   Class A/B/C below applies here too — those recipes have no version floor.
+
+3. **Accept the island and measure it.** Run vela (or your target's compiler) and read the CPU/NPU
+   split. A float island on a small tensor at the edge of the graph is often not worth removing.
+
+**Per-op recovery for the 8 version-gated rows:**
+
+| Row | Gate | On an older torch |
+|---|---|---|
+| `pad`, `ConstantPad1d/2d/3d`, `ZeroPad2d` | 1.7.0 | Pad is pure data movement: input and output share one scale, so `quantize_op_action={nn.ZeroPad2d: 'rewrite'}` + `rewrite_quantizable=True` is lossless if it lands. Otherwise fold the padding into the following conv's `padding=` argument and remove the op entirely. |
+| `ConvTranspose2d` | 1.7.0 | Only torch < 1.7 is affected, which is 2020-era. If you are genuinely there, replace with `Upsample` + `Conv2d`, which quantizes on any version and is usually preferable on an NPU anyway. |
+| `LSTM`, `GRU` | 1.13.0 | See below — this is the one that bites in practice. |
+
+**LSTM / GRU below torch 1.13.** TinyNN's own quantizable implementations are gated too:
+`quantizable/lstm.py` opens with `if LooseVersion(torch.__version__) >= '1.13.0'`, and
+`FUSE_QAT_MODULES_CUSTOM[nn.GRU]` is only populated inside the same guard — both depend on
+`torch.ao.nn.quantizable`, which does not exist earlier. So there is no static path. Three
+alternatives, all available on older torch:
+
+- **`config={'dynamic_lstm_quant': True}`** — maps `nn.LSTM` onto `nnqd.LSTM` (dynamic
+  quantization: int8 weights, float activations). It does *not* go through
+  `torch.ao.nn.quantizable`, so it works on much older releases, and the converter side is
+  registered (`aten::quantized_lstm`, `quantized::linear_dynamic`,
+  `quantized::linear_relu_dynamic`). Weights shrink, activations stay float — acceptable when the
+  RNN is memory-bound, useless if you need full int8 for an NPU.
+- **`TFLiteConverter(..., unroll_rnn=True)`** — expands the recurrence into primitive ops
+  (`matmul`, `add`, `sigmoid`, `tanh`), all of which quantize on any version. The graph gets large
+  and ugly, but it is fully quantizable and every op has a converter.
+- **Rewrite the recurrence in the model** as explicit per-step `nn.Linear` + activations. Most
+  control, most work; the same advice as `nn.RNN` in Class E, which has no version floor at all.
+
+`check_gaps.py` prints the version-lifted set for whatever torch is installed, so run it inside the
+pinned environment rather than trusting the table above.
+
+
 ## 2. "Not quantizable" is not the same as "not convertible"
 
 Of the 20 genuinely residual ops, **18 have an `aten::` converter registered**. They convert
@@ -237,6 +302,7 @@ python tools/check_gaps.py
 ```
 
 Re-derives the residual set against the installed PyTorch and the TinyNeuralNetwork checkout, and
-reports drift from the 20 ops documented here. Rerun after a torch upgrade or a TinyNN update — a
+reports drift from the 20 ops documented here. It also prints the version-lifted set, which is what
+§1.1 depends on - run it inside a pinned environment to see that environment's real gaps. Rerun after a torch upgrade or a TinyNN update — a
 newer PyTorch shrinks the set, a newer TinyNN may add entries to `Q_MODULES_MAPPING` or
 `REWRITE_QUANTIZABLE_RULE_LIST`.
