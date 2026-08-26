@@ -1,0 +1,35 @@
+# ---- Large binaries / datasets / artifacts (not tracked) ----
+data/
+out/
+weights/
+YOLO/weights/
+TinyNeuralNetwork/out/
+TinyNeuralNetwork/build/
+deploy/out/
+deploy/out.intern-reference/
+deploy/calib_images/
+
+# Model / checkpoint formats
+*.pt
+*.pth
+*.tflite
+*.onnx
+*.vela
+*.tar.gz
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+.ipynb_checkpoints/
+
+# ---- Logs / temp ----
+*.log
+pip_log/
+.DS_Store

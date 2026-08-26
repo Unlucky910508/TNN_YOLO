@@ -1,0 +1,71 @@
+diff --git a/tinynn/converter/operators/optimize.py b/tinynn/converter/operators/optimize.py
+index f6f7e06..4aecc0c 100644
+--- a/tinynn/converter/operators/optimize.py
++++ b/tinynn/converter/operators/optimize.py
+@@ -2798,14 +2798,16 @@ class GraphOptimizer(object):
+                 for arr in np.split(output_tensor.tensor, num_chunks, 3)
+             ]
+             weights = [
+-                self.create_attr_tensor(arr, quantization=weight_tensor.quantization)
+-                for arr in np.split(weight_tensor.tensor, num_chunks, 0)
++                self.create_attr_tensor(arr, quantization=slice_per_channel_quantization(weight_tensor, num_chunks, i))
++                for i, arr in enumerate(np.split(weight_tensor.tensor, num_chunks, 0))
+             ]
+ 
+             if bias_tensor is not None:
+                 biases = [
+-                    self.create_attr_tensor(arr, quantization=bias_tensor.quantization)
+-                    for arr in np.split(bias_tensor.tensor, num_chunks, 0)
++                    self.create_attr_tensor(
++                        arr, quantization=slice_per_channel_quantization(bias_tensor, num_chunks, i)
++                    )
++                    for i, arr in enumerate(np.split(bias_tensor.tensor, num_chunks, 0))
+                 ]
+             else:
+                 biases = [None] * num_chunks
+@@ -3778,6 +3780,24 @@ def is_high_dim_transpose_node(vertex: ig.Vertex, graph_converter: ig.Graph, max
+     return vertex['node_type'] == ExtendedOperator.TRANSPOSE and vertex['op'].inputs[1].tensor.size > max_transpose_dims
+ 
+ 
++def slice_per_channel_quantization(tensor: tfl.Tensor, num_chunks: int, chunk_idx: int):
++    # When a tensor is split along the quantized dimension (e.g. group conv rewrite),
++    # per-channel scales/zero-points must be split accordingly.
++    quantization = tensor.quantization
++    if quantization is None:
++        return None
++    scale = np.atleast_1d(np.asarray(quantization.scale))
++    if scale.size <= 1 or scale.size % num_chunks != 0:
++        return quantization
++    new_scale = np.split(scale, num_chunks)[chunk_idx].tolist()
++    zero_point = np.atleast_1d(np.asarray(quantization.zero_point))
++    if zero_point.size == scale.size:
++        new_zero_point = np.split(zero_point, num_chunks)[chunk_idx].tolist()
++    else:
++        new_zero_point = quantization.zero_point
++    return tfl.QuantizationParameters(new_scale, new_zero_point, quantization.dim)
++
++
+ def is_group_conv_node(vertex: ig.Vertex, graph_converter: ig.Graph):
+     return (
+         vertex['node_type'] == ExtendedOperator.CONV_2D
+diff --git a/tinynn/graph/quantization/quantizer.py b/tinynn/graph/quantization/quantizer.py
+index f9b0662..8d0a7a7 100644
+--- a/tinynn/graph/quantization/quantizer.py
++++ b/tinynn/graph/quantization/quantizer.py
+@@ -1272,6 +1272,16 @@ class QATQuantizer(object):
+                                 names.append(f'{orig_name}.layer_bw.cell.add4.activation_post_process')
+                                 props.append('activation_post_process')
+                         new_fq_count += 1
++                    elif isinstance(new_mod, QSiLU):
++                        # QSiLU requantizes via its internal FloatFunctional, whose observer
++                        # holds the qparams of the tensor feeding the cat
++                        if new_fq_count == 0:
++                            acp_holder = getattr(new_mod.f_mul, 'activation_post_process', None)
++                            if acp_holder is not None:
++                                parents.append(new_mod.f_mul)
++                                names.append(f'{orig_name}.f_mul.activation_post_process')
++                                props.append('activation_post_process')
++                        new_fq_count += 1
+                     elif isinstance(new_mod, (torch_q.FakeQuantize, torch_q.ObserverBase)):
+                         if new_fq_count == 0:
+                             parents.append(parent)

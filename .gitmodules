@@ -1,0 +1,6 @@
+[submodule "TinyNeuralNetwork"]
+	path = TinyNeuralNetwork
+	url = https://github.com/alibaba/TinyNeuralNetwork.git
+[submodule "YOLO"]
+	path = YOLO
+	url = https://github.com/MultimediaTechLab/YOLO.git
